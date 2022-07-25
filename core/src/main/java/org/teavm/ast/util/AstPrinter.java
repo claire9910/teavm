@@ -31,13 +31,13 @@ import org.teavm.ast.InvocationExpr;
 import org.teavm.ast.OperationType;
 import org.teavm.ast.RecursiveVisitor;
 import org.teavm.ast.ReturnStatement;
-import org.teavm.ast.SequentialStatement;
 import org.teavm.ast.Statement;
+import org.teavm.ast.SwitchClause;
+import org.teavm.ast.SwitchStatement;
 import org.teavm.ast.UnaryExpr;
 import org.teavm.ast.VariableExpr;
 import org.teavm.ast.WhileStatement;
 import org.teavm.model.MethodReference;
-import org.teavm.model.instructions.NumericOperandType;
 
 public class AstPrinter {
     private StringBuilder sb = new StringBuilder();
@@ -300,6 +300,26 @@ public class AstPrinter {
                 visit(statement.getAlternative());
                 outdent();
             }
+            sb.append("end");
+            newLine();
+        }
+
+        @Override
+        public void visit(SwitchStatement statement) {
+            sb.append("switch ");
+            print(statement.getValue());
+            newLine();
+            indent();
+            for (SwitchClause clause : statement.getClauses()) {
+                for (int condition : clause.getConditions()) {
+                    sb.append("case ").append(condition);
+                    newLine();
+                }
+                indent();
+                visit(clause.getBody());
+                outdent();
+            }
+            outdent();
             sb.append("end");
             newLine();
         }

@@ -16,6 +16,8 @@
 package org.teavm.ast.decompilation;
 
 import com.carrotsearch.hppc.IntArrayList;
+import com.carrotsearch.hppc.IntHashSet;
+import com.carrotsearch.hppc.IntSet;
 import com.carrotsearch.hppc.IntStack;
 import com.carrotsearch.hppc.ObjectIntHashMap;
 import com.carrotsearch.hppc.ObjectIntMap;
@@ -39,6 +41,8 @@ import org.teavm.ast.OperationType;
 import org.teavm.ast.ReturnStatement;
 import org.teavm.ast.SequentialStatement;
 import org.teavm.ast.Statement;
+import org.teavm.ast.SwitchClause;
+import org.teavm.ast.SwitchStatement;
 import org.teavm.ast.UnaryExpr;
 import org.teavm.ast.UnaryOperation;
 import org.teavm.ast.WhileStatement;
@@ -49,7 +53,6 @@ import org.teavm.model.BasicBlock;
 import org.teavm.model.Instruction;
 import org.teavm.model.InvokeDynamicInstruction;
 import org.teavm.model.Program;
-import org.teavm.model.ValueType;
 import org.teavm.model.Variable;
 import org.teavm.model.instructions.ArrayLengthInstruction;
 import org.teavm.model.instructions.AssignInstruction;
@@ -89,6 +92,7 @@ import org.teavm.model.instructions.PutFieldInstruction;
 import org.teavm.model.instructions.RaiseInstruction;
 import org.teavm.model.instructions.StringConstantInstruction;
 import org.teavm.model.instructions.SwitchInstruction;
+import org.teavm.model.instructions.SwitchTableEntry;
 import org.teavm.model.instructions.UnwrapArrayInstruction;
 import org.teavm.model.util.DefinitionExtractor;
 import org.teavm.model.util.ProgramUtils;
@@ -104,7 +108,6 @@ public class NewDecompiler {
     private int[] dfs;
     private int[] varUsageCount;
     private int[] varDefinitionCount;
-    private boolean[] varUsedOnce;
     private List<ExprStackElement> exprStack = new ArrayList<>();
     private Expr[] relocatableVars;
     private List<Statement> statements;
@@ -270,7 +273,6 @@ public class NewDecompiler {
         IntStack stack = new IntStack();
         stack.push(currentBlock.getIndex());
         IntArrayList nonLoopTargets = new IntArrayList();
-        IntArrayList candidates = new IntArrayList();
         BasicBlock bestExit = null;
         int bestExitScore = 0;
 
@@ -278,7 +280,6 @@ public class NewDecompiler {
             int node = stack.pop();
             int[] targets = domGraph.outgoingEdges(node * 2 + 1);
 
-            int nonLoopTargetsIndex = 0;
             for (int target : targets) {
                 if (!loopNodes[target / 2]) {
                     nonLoopTargets.add(target / 2);
@@ -421,9 +422,8 @@ public class NewDecompiler {
             return relocatable;
         }
 
-        int index = 0;
         if (usageCount == 1 && !exprStack.isEmpty()) {
-            index = exprStack.size() - 1;
+            int index = exprStack.size() - 1;
             ExprStackElement element = exprStack.get(index);
             if (exprStack.get(index).variable == variable) {
                 exprStack.remove(index);
@@ -596,10 +596,6 @@ public class NewDecompiler {
             assignVariable(insn.getReceiver().getIndex(), result, relocatable);
         }
 
-        private void unary() {
-
-        }
-
         @Override
         public void visit(AssignInstruction insn) {
 
@@ -726,8 +722,8 @@ public class NewDecompiler {
 
             int sourceNode = blockExitNode(currentBlock);
             int[] immediatelyDominatedNodes = domGraph.outgoingEdges(sourceNode);
-            boolean ownsTrueBranch = ownsBranch(currentBlock, ifTrue);
-            boolean ownsFalseBranch = ownsBranch(currentBlock, ifFalse);
+            boolean ownsTrueBranch = ownsBranch(ifTrue);
+            boolean ownsFalseBranch = ownsBranch(ifFalse);
 
             int childBlockCount = immediatelyDominatedNodes.length;
             if (ownsTrueBranch) {
@@ -745,6 +741,9 @@ public class NewDecompiler {
                     continue;
                 }
                 childBlocks[j++] = childBlock;
+            }
+            if (childBlockCount < childBlocks.length) {
+                childBlocks = Arrays.copyOf(childBlocks, childBlockCount);
             }
             Arrays.sort(childBlocks, Comparator.comparing(b -> dfs[b.getIndex()]));
 
@@ -779,9 +778,15 @@ public class NewDecompiler {
             }
 
             optimizeIf(ifStatement);
+            addBlockStatements(blockStatements, childBlocks, ifStatement);
 
+            currentBlock = childBlocks.length > 0 ? childBlocks[childBlocks.length - 1] : null;
+        }
+
+        private void addBlockStatements(BlockStatement[] blockStatements, BasicBlock[] childBlocks,
+                Statement statement) {
             if (blockStatements.length > 0) {
-                blockStatements[0].getBody().add(ifStatement);
+                blockStatements[0].getBody().add(statement);
                 for (int i = 0; i < childBlocks.length - 1; ++i) {
                     BlockStatement prevBlockStatement = blockStatements[i];
                     optimizeConditionalBlock(prevBlockStatement);
@@ -794,10 +799,8 @@ public class NewDecompiler {
                 optimizeConditionalBlock(lastBlockStatement);
                 addChildBlock(lastBlockStatement, statements);
             } else {
-                statements.add(ifStatement);
+                statements.add(statement);
             }
-
-            currentBlock = childBlocks.length > 0 ? childBlocks[childBlocks.length - 1] : null;
         }
 
         private void loopExitBranch(Expr expr, BasicBlock loopExit, BasicBlock next) {
@@ -818,7 +821,7 @@ public class NewDecompiler {
             }
         }
 
-        private boolean ownsBranch(BasicBlock condition, BasicBlock branch) {
+        private boolean ownsBranch(BasicBlock branch) {
             return dom.immediateDominatorOf(blockEnterNode(branch)) == blockExitNode(currentBlock)
                     && enteringBlockCount(branch) == 1;
         }
@@ -944,7 +947,74 @@ public class NewDecompiler {
 
         @Override
         public void visit(SwitchInstruction insn) {
+            SwitchStatement statement = new SwitchStatement();
+            statements.add(statement);
+            statement.setValue(getVariable(insn.getCondition().getIndex()));
 
+            List<SwitchTableEntry> entries = new ArrayList<>(insn.getEntries());
+            entries.sort(Comparator.comparingInt(entry -> dfs[entry.getTarget().getIndex()]));
+            int sourceNode = blockExitNode(currentBlock);
+            int[] immediatelyDominatedNodes = domGraph.outgoingEdges(sourceNode);
+
+            IntSet targetBlocks = new IntHashSet();
+            boolean[] ownedEntries = new boolean[entries.size()];
+            for (int i = 0; i < entries.size(); ++i) {
+                SwitchTableEntry entry = entries.get(i);
+                boolean ownsEntry = ownsBranch(entry.getTarget());
+                if (ownsEntry) {
+                    ownedEntries[i] = ownsEntry;
+                }
+            }
+            boolean ownsDefault = ownsBranch(insn.getDefaultTarget());
+            if (ownsDefault) {
+                targetBlocks.add(insn.getDefaultTarget().getIndex());
+            }
+
+            BasicBlock[] childBlocks = new BasicBlock[immediatelyDominatedNodes.length];
+            int childBlockCount = 0;
+            for (int i = 0; i < immediatelyDominatedNodes.length; ++i) {
+                BasicBlock childBlock = program.basicBlockAt(immediatelyDominatedNodes[i] / 2);
+                if (!targetBlocks.contains(childBlock.getIndex())) {
+                    childBlocks[childBlockCount++] = childBlock;
+                }
+            }
+            Arrays.sort(childBlocks, Comparator.comparing(b -> dfs[b.getIndex()]));
+
+            BlockStatement[] blockStatements = new BlockStatement[childBlockCount];
+            for (int i = 0; i < childBlocks.length; i++) {
+                BasicBlock childBlock = childBlocks[i];
+                BlockStatement blockStatement = new BlockStatement();
+                jumpTargets[childBlock.getIndex()] = blockStatement;
+                blockStatements[i] = blockStatement;
+            }
+
+            for (int i = 0; i < entries.size(); ++i) {
+                SwitchTableEntry entry = entries.get(i);
+                SwitchClause clause = new SwitchClause();
+                statement.getClauses().add(clause);
+
+                clause.setConditions(new int[] { entry.getCondition() });
+                BasicBlock blockAfterEntry = i < entries.size() - 1
+                        ? entries.get(i + 1).getTarget()
+                        : insn.getDefaultTarget();
+                if (ownedEntries[i]) {
+                    processBlock(entry.getTarget(), blockAfterEntry, clause.getBody());
+                } else if (blockAfterEntry != entry.getTarget()) {
+                    BreakStatement breakStatement = new BreakStatement();
+                    breakStatement.setTarget(getJumpTarget(blockAfterEntry));
+                    clause.getBody().add(breakStatement);
+                }
+            }
+
+            if (ownsDefault) {
+                processBlock(insn.getDefaultTarget(), nextBlock, statement.getDefaultClause());
+            } else {
+                BreakStatement breakStatement = new BreakStatement();
+                breakStatement.setTarget(getJumpTarget(insn.getDefaultTarget()));
+                statement.getDefaultClause().add(breakStatement);
+            }
+
+            currentBlock = nextBlock;
         }
 
         @Override
